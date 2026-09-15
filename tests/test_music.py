@@ -1,9 +1,16 @@
 import asyncio
 import threading
 import unittest
-from unittest.mock import AsyncMock
+from pathlib import Path
+from unittest.mock import AsyncMock, patch
 
-from music import GuildPlayer, Track
+from music import (
+    GuildPlayer,
+    TIHULU_SILENCE_FRAMES,
+    TihuluAudioSource,
+    Track,
+    load_tihulu_frames,
+)
 
 
 def track(title: str) -> Track:
@@ -48,6 +55,80 @@ class FakeVoiceChannel:
 
     async def connect(self, *, self_deaf: bool) -> FakeVoiceClient:
         return self.voice_client
+
+
+class FakeAudioSource:
+    def __init__(self, frames: list[bytes]) -> None:
+        self.frames = iter(frames)
+        self.read_count = 0
+        self.cleanup_count = 0
+
+    def read(self) -> bytes:
+        self.read_count += 1
+        return next(self.frames, b"")
+
+    def is_opus(self) -> bool:
+        return False
+
+    def cleanup(self) -> None:
+        self.cleanup_count += 1
+
+
+class TihuluAudioSourceTests(unittest.TestCase):
+    def test_substitution_consumes_song_and_resumes_at_later_frame(self) -> None:
+        quote_frames = (b"quote-one", b"quote-two")
+        total_frames = 2 + TIHULU_SILENCE_FRAMES + len(quote_frames) + 1
+        song_frames = [index.to_bytes(4) for index in range(total_frames)]
+        song = FakeAudioSource(song_frames)
+        source = TihuluAudioSource(song, quote_frames, midpoint_frame=2)
+
+        output = [source.read() for _ in range(total_frames)]
+
+        self.assertEqual(output[:2], song_frames[:2])
+        self.assertEqual(
+            output[2 : 2 + TIHULU_SILENCE_FRAMES],
+            [b"\0" * 4] * TIHULU_SILENCE_FRAMES,
+        )
+        quote_start = 2 + TIHULU_SILENCE_FRAMES
+        self.assertEqual(output[quote_start : quote_start + 2], list(quote_frames))
+        self.assertEqual(output[-1], song_frames[-1])
+        self.assertEqual(song.read_count, total_frames)
+
+    def test_underlying_eof_ends_effect_immediately(self) -> None:
+        song = FakeAudioSource([b"song"])
+        source = TihuluAudioSource(song, (b"quote",), midpoint_frame=0)
+
+        self.assertEqual(source.read(), b"\0" * 4)
+        self.assertEqual(source.read(), b"")
+
+    def test_cleanup_delegates_once(self) -> None:
+        song = FakeAudioSource([])
+        source = TihuluAudioSource(song, (), midpoint_frame=0)
+
+        source.cleanup()
+        source.cleanup()
+
+        self.assertEqual(song.cleanup_count, 1)
+
+
+class TihuluAssetTests(unittest.TestCase):
+    def test_missing_asset_raises_before_starting_ffmpeg(self) -> None:
+        with patch("music.discord.FFmpegPCMAudio") as ffmpeg:
+            with self.assertRaises(FileNotFoundError):
+                load_tihulu_frames(Path("does-not-exist.mp3"))
+
+        ffmpeg.assert_not_called()
+
+    def test_asset_is_loaded_and_cleaned_up(self) -> None:
+        source = FakeAudioSource([b"one", b"two"])
+        with (
+            patch.object(Path, "is_file", return_value=True),
+            patch("music.discord.FFmpegPCMAudio", return_value=source),
+        ):
+            frames = load_tihulu_frames(Path("tihulu.mp3"))
+
+        self.assertEqual(frames, (b"one", b"two"))
+        self.assertEqual(source.cleanup_count, 1)
 
 
 class GuildPlayerTests(unittest.IsolatedAsyncioTestCase):
@@ -175,6 +256,78 @@ class GuildPlayerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(self.player.current, track("two"))
         self.text_channel.send.assert_awaited_once()
+
+    async def test_tihulu_rolls_again_for_loop_replay(self) -> None:
+        rolls = iter((0.04, 0.06))
+
+        async def resolve(item: Track) -> str:
+            return f"stream:{item.title}"
+
+        player = GuildPlayer(
+            1,
+            stream_resolver=resolve,
+            source_factory=lambda url: FakeAudioSource([b"song"] * 3000),
+            tihulu_frames=(b"quote",),
+            random_source=lambda: next(rolls),
+        )
+        await player.enqueue(track("one"), self.voice_channel, self.text_channel)
+        await player.toggle_loop()
+
+        self.assertIsInstance(self.voice_client.sources[0], TihuluAudioSource)
+        self.voice_client.finish()
+        await self.allow_callback()
+
+        self.assertIsInstance(self.voice_client.sources[1], FakeAudioSource)
+
+    async def test_unknown_duration_does_not_roll_or_wrap(self) -> None:
+        roll_count = 0
+
+        def roll() -> float:
+            nonlocal roll_count
+            roll_count += 1
+            return 0.0
+
+        async def resolve(item: Track) -> str:
+            return f"stream:{item.title}"
+
+        player = GuildPlayer(
+            1,
+            stream_resolver=resolve,
+            source_factory=lambda url: FakeAudioSource([b"song"]),
+            tihulu_frames=(b"quote",),
+            random_source=roll,
+        )
+        unknown = Track("unknown", "https://example.com", None, 1)
+
+        await player.enqueue(unknown, self.voice_channel, self.text_channel)
+
+        self.assertEqual(roll_count, 0)
+        self.assertIsInstance(self.voice_client.sources[0], FakeAudioSource)
+
+    async def test_short_track_does_not_roll_or_wrap(self) -> None:
+        roll_count = 0
+
+        def roll() -> float:
+            nonlocal roll_count
+            roll_count += 1
+            return 0.0
+
+        async def resolve(item: Track) -> str:
+            return f"stream:{item.title}"
+
+        player = GuildPlayer(
+            1,
+            stream_resolver=resolve,
+            source_factory=lambda url: FakeAudioSource([b"song"]),
+            tihulu_frames=tuple(b"quote" for _ in range(100)),
+            random_source=roll,
+        )
+        short = Track("short", "https://example.com", 2, 1)
+
+        await player.enqueue(short, self.voice_channel, self.text_channel)
+
+        self.assertEqual(roll_count, 0)
+        self.assertIsInstance(self.voice_client.sources[0], FakeAudioSource)
 
 
 if __name__ == "__main__":

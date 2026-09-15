@@ -11,6 +11,12 @@ A small Discord music bot that streams audio from YouTube into a voice channel.
 
 Music state is separate for each server. Playback begins when the first track is queued, and tracks added later play in FIFO order. The bot stays in the voice channel after a queue ends until `/stop` is used.
 
+## Tihulu
+
+Place your audio clip at `assets/tihulu.mp3`. On each eligible song playback, Tihulu has an independent 5% chance to appear at the song's midpoint. The music continues advancing while listeners hear one second of silence followed by the clip, then the later point in the song becomes audible again.
+
+Tracks with an unknown duration, or tracks whose second half is too short for the complete effect, are not interrupted. If the file is missing or cannot be decoded, the bot logs a warning and normal music playback continues.
+
 ## Setup
 
 1. Create an application in the [Discord Developer Portal](https://discord.com/developers/applications?new_application=true). A bot user is enabled by default for new applications.

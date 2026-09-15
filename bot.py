@@ -1,4 +1,7 @@
+import asyncio
+import logging
 import os
+from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 import discord
@@ -11,9 +14,13 @@ from music import (
     MusicError,
     MusicManager,
     Track,
+    load_tihulu_frames,
     resolve_video,
     search_youtube,
 )
+
+LOGGER = logging.getLogger(__name__)
+TIHULU_AUDIO_PATH = Path(__file__).parent / "assets" / "tihulu.mp3"
 
 
 class KabileKahyasi(commands.Bot):
@@ -23,6 +30,15 @@ class KabileKahyasi(commands.Bot):
         self.music = MusicManager()
 
     async def setup_hook(self) -> None:
+        try:
+            frames = await asyncio.to_thread(
+                load_tihulu_frames, TIHULU_AUDIO_PATH
+            )
+        except Exception as error:
+            LOGGER.warning("Tihulu audio disabled: %s", error)
+        else:
+            self.music.configure_tihulu(frames)
+            LOGGER.info("Loaded %d Tihulu audio frames", len(frames))
         await self.tree.sync()
 
     async def on_ready(self) -> None:

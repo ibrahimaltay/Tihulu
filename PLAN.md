@@ -22,3 +22,9 @@ if a song is already playing, it should be added to the queue.
 `/loop` -> toggle loop on / off. if loop is on, it should play the whole playlist and then start over again. Newly queued songs join the current cycle.
 
 Playback and queue state are isolated per server and are not persisted across restarts. Members must be in the bot's voice channel to use playback controls.
+
+### Tihulu
+
+The local `assets/tihulu.mp3` clip has a 5% chance to play at the midpoint of each eligible song playback, including loop replays. The song keeps advancing while one second of silence and the Tihulu clip replace its audible PCM frames, then playback becomes audible again at the later song position.
+
+Songs with unknown duration or insufficient time after the midpoint are excluded. A missing or invalid clip disables only Tihulu and does not prevent music playback.

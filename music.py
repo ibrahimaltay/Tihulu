@@ -1,7 +1,9 @@
 import asyncio
 import logging
+import random
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, cast
 
 import discord
@@ -14,6 +16,9 @@ FFMPEG_BEFORE_OPTIONS = (
     "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
 )
 FFMPEG_OPTIONS = "-vn"
+PCM_FRAMES_PER_SECOND = 50
+TIHULU_SILENCE_FRAMES = PCM_FRAMES_PER_SECOND
+TIHULU_CHANCE = 0.05
 YT_DLP_RUNTIME_OPTIONS: dict[str, Any] = {
     "js_runtimes": {"deno": {}, "node": {}}
 }
@@ -133,6 +138,7 @@ async def resolve_stream(track: Track) -> str:
 
 StreamResolver = Callable[[Track], Awaitable[str]]
 SourceFactory = Callable[[str], discord.AudioSource]
+RandomSource = Callable[[], float]
 
 
 def create_audio_source(stream_url: str) -> discord.AudioSource:
@@ -143,6 +149,65 @@ def create_audio_source(stream_url: str) -> discord.AudioSource:
     )
 
 
+def load_tihulu_frames(path: Path) -> tuple[bytes, ...]:
+    if not path.is_file():
+        raise FileNotFoundError(path)
+
+    source = discord.FFmpegPCMAudio(str(path), options=FFMPEG_OPTIONS)
+    try:
+        frames = []
+        while frame := source.read():
+            frames.append(frame)
+    finally:
+        source.cleanup()
+
+    if not frames:
+        raise MusicError(f"Tihulu audio is empty or unreadable: {path}")
+    return tuple(frames)
+
+
+class TihuluAudioSource(discord.AudioSource):
+    def __init__(
+        self,
+        source: discord.AudioSource,
+        quote_frames: tuple[bytes, ...],
+        midpoint_frame: int,
+    ) -> None:
+        if source.is_opus():
+            raise ValueError("Tihulu requires a PCM audio source.")
+        self._source = source
+        self._quote_frames = quote_frames
+        self._midpoint_frame = midpoint_frame
+        self._frame_index = 0
+        self._cleaned_up = False
+
+    def read(self) -> bytes:
+        song_frame = self._source.read()
+        if not song_frame:
+            return b""
+
+        interruption_frame = self._frame_index - self._midpoint_frame
+        self._frame_index += 1
+        if interruption_frame < 0:
+            return song_frame
+        if interruption_frame < TIHULU_SILENCE_FRAMES:
+            return bytes(len(song_frame))
+
+        quote_index = interruption_frame - TIHULU_SILENCE_FRAMES
+        if quote_index < len(self._quote_frames):
+            return self._quote_frames[quote_index]
+        return song_frame
+
+    def is_opus(self) -> bool:
+        return False
+
+    def cleanup(self) -> None:
+        if self._cleaned_up:
+            return
+        self._cleaned_up = True
+        self._source.cleanup()
+
+
 class GuildPlayer:
     def __init__(
         self,
@@ -150,6 +215,8 @@ class GuildPlayer:
         *,
         stream_resolver: StreamResolver = resolve_stream,
         source_factory: SourceFactory = create_audio_source,
+        tihulu_frames: tuple[bytes, ...] = (),
+        random_source: RandomSource = random.random,
     ) -> None:
         self.guild_id = guild_id
         self.playlist: list[Track] = []
@@ -160,6 +227,8 @@ class GuildPlayer:
         self.text_channel: Any | None = None
         self._stream_resolver = stream_resolver
         self._source_factory = source_factory
+        self._tihulu_frames = tihulu_frames
+        self._random_source = random_source
         self._lock = asyncio.Lock()
         self._generation = 0
 
@@ -235,6 +304,7 @@ class GuildPlayer:
             try:
                 stream_url = await self._stream_resolver(track)
                 source = self._source_factory(stream_url)
+                source = self._maybe_add_tihulu(source, track)
             except Exception as error:
                 LOGGER.exception("Could not prepare %s", track.title)
                 await self._notify_failure(track)
@@ -266,6 +336,21 @@ class GuildPlayer:
             return
 
         self.current = None
+
+    def _maybe_add_tihulu(
+        self, source: discord.AudioSource, track: Track
+    ) -> discord.AudioSource:
+        if track.duration is None or not self._tihulu_frames:
+            return source
+
+        total_frames = track.duration * PCM_FRAMES_PER_SECOND
+        midpoint_frame = total_frames // 2
+        effect_frames = TIHULU_SILENCE_FRAMES + len(self._tihulu_frames)
+        if total_frames - midpoint_frame < effect_frames:
+            return source
+        if self._random_source() >= TIHULU_CHANCE:
+            return source
+        return TihuluAudioSource(source, self._tihulu_frames, midpoint_frame)
 
     async def _after_track(
         self, generation: int, error: Exception | None
@@ -301,6 +386,10 @@ class GuildPlayer:
 class MusicManager:
     def __init__(self) -> None:
         self.players: dict[int, GuildPlayer] = {}
+        self.tihulu_frames: tuple[bytes, ...] = ()
+
+    def configure_tihulu(self, frames: tuple[bytes, ...]) -> None:
+        self.tihulu_frames = frames
 
     def get(self, guild_id: int) -> GuildPlayer | None:
         return self.players.get(guild_id)
@@ -308,7 +397,7 @@ class MusicManager:
     def get_or_create(self, guild_id: int) -> GuildPlayer:
         player = self.players.get(guild_id)
         if player is None:
-            player = GuildPlayer(guild_id)
+            player = GuildPlayer(guild_id, tihulu_frames=self.tihulu_frames)
             self.players[guild_id] = player
         return player
 
