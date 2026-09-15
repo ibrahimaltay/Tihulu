@@ -1,4 +1,4 @@
-# Kabile Kahyasi
+# Tihulu
 
 A small Discord music bot that streams audio from YouTube into a voice channel.
 
